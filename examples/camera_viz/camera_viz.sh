@@ -47,10 +47,12 @@ log_step()  { echo -e "\n\033[1m=== $* ===${_C_RESET}"; }
 # ──────────────────────────────────────────────────────────────────────
 
 # Sets REMOTE_{HOST,USER,PASSWORD}; remaining positionals → REMOTE_REST[].
+# Defaults come from $REMOTE_HOST / $REMOTE_USER / $REMOTE_PASSWORD if
+# those are exported in the calling shell; CLI flags override.
 parse_remote_args() {
-    REMOTE_HOST=""
-    REMOTE_USER=""
-    REMOTE_PASSWORD=""
+    : "${REMOTE_HOST:=}"
+    : "${REMOTE_USER:=}"
+    : "${REMOTE_PASSWORD:=}"
     REMOTE_REST=()
     while (( $# )); do
         case $1 in
@@ -61,10 +63,10 @@ parse_remote_args() {
             *)  REMOTE_REST+=("$1"); shift;;
         esac
     done
-    [[ -n "$REMOTE_HOST" ]] || { log_error "--host is required"; exit 1; }
-    [[ -n "$REMOTE_USER" ]] || { log_error "--user is required"; exit 1; }
+    [[ -n "$REMOTE_HOST" ]] || { log_error "--host (or \$REMOTE_HOST) is required"; exit 1; }
+    [[ -n "$REMOTE_USER" ]] || { log_error "--user (or \$REMOTE_USER) is required"; exit 1; }
     if [[ -n "$REMOTE_PASSWORD" ]] && ! command -v sshpass >/dev/null 2>&1; then
-        log_error "--password set but sshpass not installed. apt install sshpass, or drop --password and use key auth."
+        log_error "REMOTE_PASSWORD set but sshpass not installed. apt install sshpass, or drop the password and use key auth."
         exit 1
     fi
 }
@@ -120,8 +122,31 @@ rsync_to_remote() {
 # ──────────────────────────────────────────────────────────────────────
 
 cmd_setup() {
+    # Intercept --venv so $HERE/.venv becomes a symlink to the caller's
+    # path. The rest of camera_viz.sh (cmd_run / cmd_loopback) hardcodes
+    # $HERE/.venv; routing it through a symlink lets ``setup --venv PATH``
+    # work without touching every command.
+    local custom_venv=""
+    local rest=()
+    while (( $# )); do
+        case $1 in
+            --venv) custom_venv=$2; shift 2;;
+            *)      rest+=("$1"); shift;;
+        esac
+    done
+
+    if [[ -n "$custom_venv" ]]; then
+        custom_venv=$(realpath -m "$custom_venv")
+        if [[ -e "$HERE/.venv" && ! -L "$HERE/.venv" ]]; then
+            log_error "$HERE/.venv exists as a real directory; rm it (or move it) before using --venv."
+            exit 1
+        fi
+        ln -sfn "$custom_venv" "$HERE/.venv"
+        log_info "linked $HERE/.venv → $custom_venv"
+    fi
+
     log_step "Local setup"
-    exec "$SCRIPTS_DIR/_install_deps.sh" "$@"
+    exec "$SCRIPTS_DIR/_install_deps.sh" "${rest[@]}"
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -210,12 +235,21 @@ cmd_loopback() {
 # ──────────────────────────────────────────────────────────────────────
 
 cmd_deploy() {
-    # Filter --no-service out of "$@" before parse_remote_args runs;
-    # otherwise it lands in REMOTE_REST and gets mistaken for the config.
+    # Pull deploy-only flags out of "$@" before parse_remote_args runs;
+    # anything we don't recognize would land in REMOTE_REST (where the
+    # positional CONFIG lives).
     local no_service=false
+    # ``--streaming-host`` → injected as ``--host`` on camera_streamer.py's
+    # CLI inside the rendered systemd unit. Lets you keep the YAML at
+    # 127.0.0.1 for loopback and override only when deploying to a robot.
+    local streaming_host="${STREAMING_HOST:-}"
     local filtered=()
-    for arg in "$@"; do
-        if [[ "$arg" == "--no-service" ]]; then no_service=true; else filtered+=("$arg"); fi
+    while (( $# )); do
+        case $1 in
+            --no-service)     no_service=true; shift;;
+            --streaming-host) streaming_host=$2; shift 2;;
+            *)                filtered+=("$1"); shift;;
+        esac
     done
     set -- "${filtered[@]}"
 
@@ -242,16 +276,32 @@ cmd_deploy() {
     log_step "Installing deps on robot (sender-only, jetson)"
     # ``deploy`` targets Jetson robots, so we always pass --jetson:
     # JetPack ships partial CUDA + skips the unversioned symlinks the
-    # cupy loader needs. TTY so apt's sudo can prompt.
+    # cupy loader needs. If the Jetson is missing system packages /
+    # symlinks, _install_deps.sh prompts on the TTY (ssh -t) and either
+    # runs the sudo commands after the operator types ``y`` or aborts.
     ssh_run_tty "cd $REMOTE_DIR && bash scripts/_install_deps.sh --sender-only --jetson"
     log_ok "deps installed"
 
     if $no_service; then
         log_ok "source + deps installed (service skipped)"
+        local manual_host_flag=""
+        if [[ -n "$streaming_host" ]]; then
+            manual_host_flag=" --host $streaming_host"
+            log_info "(--streaming-host has no effect in --no-service mode — pass it to camera_streamer.py yourself.)"
+        fi
         log_info "Run manually with:"
-        log_info "  ssh $REMOTE_USER@$REMOTE_HOST 'cd ~/camera_viz && .venv/bin/python camera_streamer.py $config'"
+        log_info "  ssh $REMOTE_USER@$REMOTE_HOST 'cd ~/camera_viz && .venv/bin/python camera_streamer.py $config$manual_host_flag'"
         log_info "Re-run without --no-service when you're ready to install the systemd unit."
         return 0
+    fi
+
+    # Empty when --streaming-host wasn't given — ExecStart falls back to
+    # streaming.host from the YAML. Leading space so the substituted
+    # template doesn't end with a trailing space when empty.
+    local extra_args=""
+    if [[ -n "$streaming_host" ]]; then
+        extra_args=" --host $streaming_host"
+        log_info "streaming.host overridden: --host $streaming_host"
     fi
 
     log_step "Installing systemd unit"
@@ -267,6 +317,7 @@ mkdir -p "\$unit_dir"
 sed -e "s|{{WORKDIR}}|\$workdir|g" \
     -e "s|{{VENV}}|\$venv|g" \
     -e "s|{{CONFIG}}|\$config|g" \
+    -e "s|{{EXTRA_ARGS}}|${extra_args}|g" \
     "\$workdir/scripts/${SERVICE_NAME}.service.in" \
     > "\$unit_dir/${SERVICE_NAME}.service"
 echo "wrote \$unit_dir/${SERVICE_NAME}.service"
@@ -327,16 +378,26 @@ show_help() {
 camera_viz.sh — local development + Jetson deployment for camera_viz
 
 LOCAL
-    setup [--sender-only] [--jetson] [--no-v4l2] [--no-oakd] [--no-rtp] [--with-zed]
-                          Create .venv, install deps, build native codec.
-                          Missing python3-gi / GStreamer plugins are
-                          apt-installed on Debian/Ubuntu regardless of
-                          host kind.
+    setup [--venv PATH] [--sender-only] [--jetson]
+          [--no-v4l2] [--no-oakd] [--no-rtp] [--with-zed]
+                          Create .venv, install Python deps via uv into
+                          the venv, build native codec. Python deps stay
+                          inside .venv (no --system-site-packages).
+                          System-side prerequisites (GStreamer plugins,
+                          cairo/girepository dev headers, cuda-nvrtc on
+                          Jetson, etc.) are PROBED. If anything is
+                          missing the script prints the exact apt-get
+                          command and prompts ``y/N`` before running it.
+                          Reply N or run non-interactively to abort.
+                          --venv PATH installs into an existing venv at
+                          PATH instead of creating one in-place.
+                          examples/camera_viz/.venv is symlinked → PATH
+                          so run / loopback pick it up too.
                           --sender-only skips the isaacteleop wheel + vulkan
                           deps (use on Jetson sender hosts).
-                          --jetson adds JetPack-only steps on top: apt-
-                          install cuda-nvrtc and create the unversioned
-                          CUDA lib symlinks JetPack skips. Off on desktop.
+                          --jetson adds JetPack-only checks: unversioned
+                          CUDA lib symlinks + ld.so wiring that JetPack
+                          skips. Off on desktop.
 
     loopback CONFIG       Run camera_streamer + camera_viz on 127.0.0.1.
 
@@ -346,28 +407,47 @@ LOCAL
                           receiver binds 0.0.0.0).
 
 REMOTE (Jetson robot)
-    deploy --host H --user U [--password P] [--no-service] CONFIG
+    deploy [--host H --user U [--password P]]
+           [--streaming-host IP] [--no-service] CONFIG
                           rsync source, install deps, install + start
                           systemd user service running camera_streamer.py.
                           --no-service stops after deps so you can run
                           camera_streamer.py by hand first.
+                          --streaming-host injects ``--host IP`` into the
+                          unit's ExecStart so the sender streams there
+                          regardless of streaming.host in the YAML. Same
+                          knob via $STREAMING_HOST env var. Leave unset
+                          to use the YAML value.
 
-    service-status   --host H --user U [--password P]
-    service-logs     --host H --user U [--password P]
-    service-restart  --host H --user U [--password P]
+    service-status   [--host H --user U [--password P]]
+    service-logs     [--host H --user U [--password P]]
+    service-restart  [--host H --user U [--password P]]
                           Inspect / manage the deployed service.
+
+ENVIRONMENT (remote commands)
+    REMOTE_HOST, REMOTE_USER, REMOTE_PASSWORD
+                          Defaults for --host / --user / --password. CLI
+                          flags override. Drop the flags from your shell
+                          history by exporting these once per session.
+
+    STREAMING_HOST        Default for --streaming-host on ``deploy``.
 
 EXAMPLES
     ./camera_viz.sh setup
     ./camera_viz.sh loopback configs/v4l2.yaml
     ./camera_viz.sh deploy --host 10.29.90.127 --user nvidia configs/v4l2.yaml
     ./camera_viz.sh run configs/v4l2.yaml
-    ./camera_viz.sh service-logs --host 10.29.90.127 --user nvidia
+
+    # Env-var style (avoids passwords in shell history / argv):
+    export REMOTE_HOST=10.29.90.127 REMOTE_USER=nvidia
+    read -s REMOTE_PASSWORD && export REMOTE_PASSWORD
+    ./camera_viz.sh deploy configs/v4l2.yaml
+    ./camera_viz.sh service-logs
 
 SSH AUTH
-    Without --password, uses your SSH keys. With --password, uses sshpass
-    (apt install sshpass). The password is passed via process args, so
-    avoid this on shared hosts.
+    Without a password set, uses your SSH keys. With one, uses sshpass
+    (apt install sshpass). Passwords are forwarded to sshpass via the
+    SSHPASS env var (sshpass -e), so they don't appear in process argv.
 EOF
 }
 

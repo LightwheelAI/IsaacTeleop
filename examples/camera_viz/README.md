@@ -5,94 +5,89 @@ SPDX-License-Identifier: Apache-2.0
 
 # camera_viz
 
-Camera streaming + visualization on Televiz (`isaacteleop.viz`).
+> Camera streaming + visualization on Televiz (`isaacteleop.viz`).
 
-Two ways to use it:
-
-1. **Direct**: workstation runs the viewer with cameras attached locally.
-2. **Split**: robot runs the sender, ships RTP H.264 to a workstation receiver. Wired Ethernet only -- the current sender doesn't handle packet loss / jitter beyond what GStreamer's stock RTP layer provides.
+| Mode | What it does |
+|---|---|
+| **Direct** | Workstation runs the viewer with cameras attached locally. |
+| **Split**  | Robot runs the sender, ships RTP H.264 to a workstation receiver. Wired Ethernet only. |
 
 ## Supported cameras
 
 | YAML `type:` | Notes |
 |---|---|
-| `synthetic` | GPU test pattern -- no hardware, useful for sanity checks |
-| `v4l2` | USB / UVC -- anything `v4l2-ctl --list-formats-ext` shows |
-| `oakd` | OAK-D mono RGB / LEFT / RIGHT |
-| `zed` | ZED 2 / Mini / X One, left-eye mono (stereo XR not wired yet) |
+| `synthetic` | GPU test pattern — no hardware |
+| `v4l2`      | USB / UVC — anything `v4l2-ctl --list-formats-ext` shows |
+| `oakd`      | OAK-D mono RGB / LEFT / RIGHT |
+| `zed`       | ZED 2 / Mini / X One, left-eye mono (stereo XR not wired yet) |
 
-Output: window or XR headset; one plane per camera, aspect-fit by default. XR placements support `world` / `head` / `lazy` lock modes.
+Output: window or XR headset; one plane per camera, aspect-fit. XR placements: `world` / `head` / `lazy`.
+
+---
 
 ## Setup (one-time)
 
 ```bash
-# Build the IsaacTeleop wheel.
 cmake -B build -DBUILD_VIZ=ON
 cmake --build build --target python_wheel --parallel
-
-# Provision the camera_viz venv + native codec.
 examples/camera_viz/camera_viz.sh setup
 source examples/camera_viz/.venv/bin/activate
 ```
 
-`setup` apt-installs missing `python3-gi` / GStreamer plugins on Debian/Ubuntu, builds the native NVENC/NVDEC codec under `codec/`, and creates `.venv/`. Flags: `--no-{v4l2,oakd,rtp}`, `--with-zed`, `--sender-only` (skip wheel + Vulkan), `--jetson` (JetPack cuda-nvrtc + symlink fixups).
+`setup` installs every Python dep into `.venv/` via `uv` (no `--system-site-packages`), builds the native NVENC/NVDEC codec, and probes system packages (GStreamer plugins, cairo / girepository headers, JetPack `cuda-nvrtc` + ld.so wiring). If anything's missing it prints the exact `apt-get` line and prompts `[y/N]` — `n` or non-interactive aborts.
+
+Flags: `--no-{v4l2,oakd,rtp}`, `--with-zed`, `--sender-only`, `--jetson`. Pass `--venv PATH` to install into an existing venv (symlinks `.venv` → PATH so `run` / `loopback` pick it up too).
 
 ---
 
-## Mode 1 -- Direct (cameras on the workstation)
-
-Set `source: local` in the YAML, plug cameras in, run:
+## Mode 1 — Direct
 
 ```bash
 ./camera_viz.sh run configs/v4l2.yaml
 ```
 
-Swap config for `oakd.yaml`, `zed.yaml`, `synthetic.yaml`, `multi_camera.yaml`. Synthetic is the fastest sanity check (no hardware).
+Set `source: local`. Swap config for `oakd.yaml`, `zed.yaml`, `synthetic.yaml`, `multi_camera.yaml`.
 
-## Mode 2 -- Split (robot -> workstation over RTP, wired)
+## Mode 2 — Split (robot → workstation, RTP)
 
-The robot sends RTP H.264; the workstation receives + renders. **Wired Ethernet only.** No retransmit, no FEC; one dropped packet means one corrupted frame until the next IDR (default every 5 s).
+> ⚠ **Wired only.** No retransmit / FEC; one lost packet = one corrupted frame until the next IDR (default 5 s).
 
 ```bash
-# 1. In the YAML: set streaming.host to the workstation's IP, and
-#    source: rtp (so the viewer listens instead of opening cameras).
+# YAML: set source: rtp. Leave streaming.host as-is — overridden at deploy time.
 $EDITOR configs/v4l2.yaml
 
-# 2. Deploy the sender to the robot. The deployed copy is rsync'd
-#    with the YAML as-is; the robot's camera_streamer.py ignores
-#    ``source:`` and always opens local cameras.
-./camera_viz.sh deploy --host 10.0.0.5 --user nvidia configs/v4l2.yaml
-# Add --password PW if you don't have SSH keys (requires sshpass).
-# Add --no-service to stop after deps so you can run camera_streamer.py by hand first.
+# Export creds once per shell (keeps password out of history / argv):
+export REMOTE_HOST=10.0.0.5 REMOTE_USER=nvidia
+read -s REMOTE_PASSWORD && export REMOTE_PASSWORD   # if no SSH keys
+export STREAMING_HOST=10.0.0.42                      # workstation IP
 
-# 3. Run the viewer on the workstation.
-./camera_viz.sh run configs/v4l2.yaml
-
-# Operate the service:
-./camera_viz.sh service-logs    --host 10.0.0.5 --user nvidia
-./camera_viz.sh service-status  --host 10.0.0.5 --user nvidia
-./camera_viz.sh service-restart --host 10.0.0.5 --user nvidia
+./camera_viz.sh deploy configs/v4l2.yaml             # full deploy + systemd
+./camera_viz.sh run    configs/v4l2.yaml             # viewer on the workstation
+./camera_viz.sh service-{status,logs,restart}        # operate the unit
 ```
 
-`deploy` rsyncs source, runs `setup --sender-only --jetson`, installs a systemd user unit at `~/.config/systemd/user/camera-streamer.service`, and enables `loginctl enable-linger` (one-time sudo).
+What `deploy` does:
 
-The sender supervises per-camera retries forever -- camera unplug, SDK errors, network blips all recover. The service never voluntarily exits.
+1. `rsync` source to `~/camera_viz` on the robot.
+2. `ssh -t` runs `_install_deps.sh --sender-only --jetson`; the `[y/N]` prompt fires for any missing apt / CUDA wiring on the Jetson.
+3. Renders `~/.config/systemd/user/camera-streamer.service`. `--streaming-host` (or `$STREAMING_HOST`) injects `--host IP` into the unit's `ExecStart`; the YAML on disk stays untouched.
+4. `sudo loginctl enable-linger` (one-time) + `systemctl --user enable --now`.
 
-### Loopback (sender + viewer on one host)
+`--no-service` stops after step 2. The sender retries forever (unplug, SDK errors, network blips); the service never voluntarily exits.
 
-`./camera_viz.sh loopback configs/v4l2.yaml` runs both on `127.0.0.1`. Useful for testing the RTP path before involving a robot.
+### Loopback
+
+`./camera_viz.sh loopback configs/v4l2.yaml` runs sender + viewer on `127.0.0.1`. Quickest way to smoke-test the RTP path.
 
 ---
 
 ## Config
 
-One YAML drives both ends. Top-level keys:
-
 ```yaml
-source: local | rtp           # camera_viz only: open cameras or listen for RTP
+source: local | rtp           # camera_viz only
 streaming:
-  host: 192.168.1.100         # workstation IP -- used by camera_streamer in rtp mode
-encoder: auto | native | gstreamer   # auto picks native NVENC on desktop, GStreamer on Jetson
+  host: 192.168.1.100         # workstation IP (override at deploy time)
+encoder: auto | native | gstreamer
 
 cameras:
   - name: cam
@@ -101,53 +96,85 @@ cameras:
     width: 2560
     height: 720
     fps: 30
-    # ... type-specific fields (device, resolution preset, etc.)
+    # … type-specific fields
     rtp:
       port: 5000
-      bitrate_mbps: 15        # tune for your uplink
-      # gop: 150              # frames between IDRs; default fps*5
-      # gpu_id: 0             # multi-GPU: pin encoder/decoder to a specific device
+      bitrate_mbps: 15
+      # gop: 150              # default fps*5
+      # gpu_id: 0             # multi-GPU pin
 
 display:                      # camera_viz only
   mode: window | xr
   window: { width, height }
-  xr: { near_z, far_z }
-  clear_color: [r, g, b, a]   # default [0,0,0,0] (transparent)
+  xr:     { near_z, far_z }
+  clear_color: [r, g, b, a]
   placements:
-    cam:                      # keyed by camera YAML name
+    cam:
       lock_mode: lazy         # world | head | lazy
       distance: 1.5
       offset_x: 0.0
       offset_y: 0.0
-      # size: [w_m, h_m]      # default: 1.0 m wide, height from camera aspect
+      # size: [w_m, h_m]
 ```
 
-Multiple cameras -> multiple `cameras:` entries; each gets its own `rtp.port` and renders as its own plane.
+Multiple cameras → multiple `cameras:` entries; each gets its own `rtp.port` and renders as its own plane.
 
 ## Lock modes (XR)
 
 | Mode | Behavior |
 |---|---|
-| `world` | Place once in front of you; stays put |
-| `head` | Follows your head every frame |
-| `lazy` | World-locked, re-snaps when you look away (default) |
+| `world` | Placed once in front of you; stays put |
+| `head`  | Follows your head every frame |
+| `lazy`  | World-locked, re-snaps when you look away (default) |
 
-Lazy timing knobs: `look_away_angle_deg`, `reposition_distance`, `reposition_delay_s`, `transition_duration_s` under `placements.<name>`.
+Lazy knobs under `placements.<name>`: `look_away_angle_deg`, `reposition_distance`, `reposition_delay_s`, `transition_duration_s`.
+
+---
 
 ## Layout
 
 ```
 camera_viz/
-├── camera_viz.sh        # CLI: setup / loopback / run / deploy / service-*
-├── camera_viz.py        # receiver / viewer
-├── camera_streamer.py   # robot-side RTP sender (per-camera supervisor, retries forever)
-├── pipeline/            # source ABC + threaded runner
-├── placements/          # XR lock-mode strategies
-├── sources/             # V4L2 / OAK-D / ZED / synthetic / rtp_h264
-├── transports/          # RTP sender + receiver, native + GStreamer encoders
-├── codec/               # native NVENC/NVDEC pybind module
-├── configs/             # one YAML per camera kind
+├── camera_viz.sh        — CLI: setup / loopback / run / deploy / service-*
+├── camera_viz.py        — receiver / viewer
+├── camera_streamer.py   — robot-side RTP sender (per-camera supervisor)
+├── pipeline/            — source ABC + threaded runner
+├── placements/          — XR lock-mode strategies
+├── sources/             — V4L2 / OAK-D / ZED / synthetic / rtp_h264
+├── transports/          — RTP sender + receiver, native + GStreamer
+├── codec/               — native NVENC/NVDEC pybind module
+├── configs/             — one YAML per camera kind
 └── scripts/
-    ├── _install_deps.sh             # shared installer (used by setup + deploy)
-    └── camera-streamer.service.in   # systemd unit template
+    ├── _install_deps.sh             — installer (setup + deploy)
+    └── camera-streamer.service.in   — systemd unit template
 ```
+
+---
+
+## Sharing the XR session with TeleopSession
+
+Only one OpenXR session is allowed per process. `VizSession` can own it and hand its live handles to `TeleopSession` / `DeviceIOSession` so they skip creating their own:
+
+```python
+import isaacteleop.viz as viz
+from teleopcore.oxr import OpenXRSessionHandles
+
+cfg = viz.VizSessionConfig()
+cfg.mode = viz.DisplayMode.kXr
+# Aggregate the XR extensions downstream trackers need (e.g.
+# XR_NVX1_action_context for ControllerTracker) so they're present
+# on the XrInstance we're about to create.
+cfg.required_extensions = DeviceIOSession.get_required_extensions(trackers)
+viz_session = viz.VizSession.create(cfg)
+
+# Pass the live handles into TeleopSession via its config.
+config = TeleopSessionConfig(
+    app_name="MyApp",
+    pipeline=pipeline,
+    oxr_handles=OpenXRSessionHandles(*viz_session.get_oxr_handles()),
+)
+with TeleopSession(config) as session:
+    ...
+```
+
+`viz_session.get_oxr_handles()` returns `(instance, session, space, proc_addr)` as raw `uint64`s, or `None` outside `kXr`.
