@@ -12,34 +12,50 @@ from typing import List
 
 from pipeline import FrameSource
 
+from ._helpers import PairedFrameSource, set_verbose
 from .oakd import OakdSource
 from .rtp_h264 import RtpH264Source
-from .synthetic import SyntheticSource
+from .synthetic import SyntheticSource, SyntheticStereoSource
 from .v4l2 import V4l2Source
 from .zed import ZedSource
 
 __all__ = [
     "OakdSource",
+    "PairedFrameSource",
     "RtpH264Source",
     "SyntheticSource",
+    "SyntheticStereoSource",
     "V4l2Source",
     "ZedSource",
     "build_local_camera",
+    "set_verbose",
 ]
 
 
 def build_local_camera(spec: dict) -> List[FrameSource]:
-    """Build the local FrameSource(s) for one ``cameras:`` entry.
+    """Build local FrameSource(s) for one ``cameras:`` entry.
 
-    Returns a list because multi-stream cameras (OAK-D stereo, ZED stereo)
-    fan out to one source per stream. Single-stream cameras return [source].
-    Shared by camera_viz.py and camera_streamer.py — keep the schema stable.
+    Mono → [source]; ``stereo: true`` → [PairedFrameSource]. v4l2 rejects
+    stereo (UVC is mono). Shared by camera_viz + camera_streamer.
     """
     kind = spec["type"]
+    stereo = bool(spec.get("stereo", False))
+    name = spec["name"]
     if kind == "synthetic":
+        if stereo:
+            return [
+                SyntheticStereoSource(
+                    name=name,
+                    width=int(spec["width"]),
+                    height=int(spec["height"]),
+                    fps=float(spec.get("fps", 60.0)),
+                    hue_speed_hz=float(spec.get("hue_speed_hz", 0.25)),
+                    disparity_px=int(spec.get("disparity_px", 20)),
+                )
+            ]
         return [
             SyntheticSource(
-                name=spec["name"],
+                name=name,
                 width=int(spec["width"]),
                 height=int(spec["height"]),
                 fps=float(spec.get("fps", 60.0)),
@@ -47,9 +63,14 @@ def build_local_camera(spec: dict) -> List[FrameSource]:
             )
         ]
     if kind == "v4l2":
+        if stereo:
+            raise ValueError(
+                f"build_local_camera: v4l2 camera {name!r} cannot be stereo "
+                "(single-stream USB / UVC). Use type: oakd or zed."
+            )
         return [
             V4l2Source(
-                name=spec["name"],
+                name=name,
                 device=spec.get("device", "/dev/video0"),
                 width=int(spec["width"]),
                 height=int(spec["height"]),
@@ -58,10 +79,12 @@ def build_local_camera(spec: dict) -> List[FrameSource]:
             )
         ]
     if kind == "oakd":
-        return list(
+        # ``stereo: true`` shorthand for ``mode: stereo``; explicit mode wins.
+        mode = spec.get("mode", "stereo" if stereo else "mono")
+        eyes = list(
             OakdSource.build(
-                base_name=spec["name"],
-                mode=spec.get("mode", "mono"),
+                base_name=name,
+                mode=mode,
                 device_id=spec.get("device_id", ""),
                 width=int(spec["width"]),
                 height=int(spec["height"]),
@@ -72,17 +95,35 @@ def build_local_camera(spec: dict) -> List[FrameSource]:
                 rgb_fps=int(spec.get("rgb_fps", 0)),
             )
         )
+        if stereo or mode in ("stereo", "stereo_rgb"):
+            # stereo_rgb's third stream is intentionally dropped here.
+            if len(eyes) < 2:
+                raise ValueError(
+                    f"build_local_camera: oakd {name!r} stereo mode produced {len(eyes)} "
+                    "source(s); expected at least 2"
+                )
+            return [PairedFrameSource(name=name, left=eyes[0], right=eyes[1])]
+        return eyes
     if kind == "zed":
-        return list(
+        eyes = list(
             ZedSource.build(
-                base_name=spec["name"],
-                resolution=spec.get("resolution", "HD720"),
+                base_name=name,
+                width=int(spec["width"]),
+                height=int(spec["height"]),
                 fps=int(spec.get("fps", 30)),
                 serial_number=int(spec.get("serial_number", 0)),
                 bus_type=spec.get("bus_type", "usb"),
-                stereo=bool(spec.get("stereo", False)),
+                stereo=stereo,
             )
         )
+        if stereo:
+            if len(eyes) != 2:
+                raise ValueError(
+                    f"build_local_camera: zed {name!r} stereo produced {len(eyes)} "
+                    "source(s); expected 2"
+                )
+            return [PairedFrameSource(name=name, left=eyes[0], right=eyes[1])]
+        return eyes
     raise ValueError(
         f"build_local_camera: unknown camera type {kind!r} "
         "(known: synthetic, v4l2, oakd, zed)"

@@ -35,7 +35,7 @@ from typing import List, Optional
 import numpy as np
 
 from pipeline import Frame, FrameSource, SourceSpec
-from ._helpers import alloc_pinned_host
+from ._helpers import alloc_pinned_host, notify, notify_verbose
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +252,21 @@ class _OakdDevice:
             else dai.Device.getAllAvailableDevices()[0]
         )
         device = dai.Device(device_info)
+
+        # SUPER = USB 3.0+; HIGH / FULL / LOW = USB 2, silently caps fps
+        # under stereo / BGR / 720p+ workloads.
+        try:
+            speed_name = getattr(device.getUsbSpeed(), "name", "?")
+        except Exception:
+            speed_name = "?"
+        if speed_name in ("HIGH", "FULL", "LOW"):
+            notify(
+                "oakd",
+                f"USB {speed_name} (NOT USB 3) — high fps / stereo / BGR will drop frames.",
+            )
+        else:
+            notify("oakd", f"USB {speed_name}")
+
         pipeline = dai.Pipeline(device)
         for s in self._stream_specs:
             socket_key = self._SOCKET_MAP[s.socket.upper()]
@@ -298,7 +313,13 @@ class _OakdDevice:
             self._produce_loop_inner(dai)
 
     def _produce_loop_inner(self, dai) -> None:
-
+        first_frame_seen = False
+        opening_notified = False
+        unavailable_notified = False
+        # Periodic actual-vs-requested fps; flags USB / VPU throttling.
+        _FPS_REPORT_S = 5.0
+        last_fps_report_at = time.monotonic()
+        last_fps_counts = {s.name: 0 for s in self._stream_specs}
         while not self._stop.is_set():
             if not self._connected:
                 now = time.monotonic()
@@ -307,32 +328,29 @@ class _OakdDevice:
                     continue
                 self._last_reconnect_attempt_s = now
                 if not self._is_device_available():
-                    logger.info(
-                        "OAK-D '%s' not visible on USB; retrying in %.1fs",
-                        self._device_id or "auto",
-                        RECONNECT_DELAY_S,
-                    )
+                    if not unavailable_notified:
+                        notify("oakd", "device not visible on USB; waiting")
+                        unavailable_notified = True
                     continue
+                if not opening_notified:
+                    notify("oakd", "opening...")
+                    opening_notified = True
                 try:
                     self._connected = self._open_device()
                 except Exception as e:
-                    logger.warning("OAK-D open failed (%s); retrying", e)
+                    notify("oakd", f"open failed ({e})")
                     self._close_device()
                     self._reconnect_count += 1
                     continue
-                logger.info(
-                    "OAK-D '%s' connected (streams=%s)%s",
-                    self._device_id or "auto",
-                    [s.name for s in self._stream_specs],
-                    f" (reconnect #{self._reconnect_count})"
-                    if self._reconnect_count
-                    else "",
-                )
+                notify("oakd", "connected")
+                first_frame_seen = False
+                opening_notified = False
+                unavailable_notified = False
 
             try:
                 self._pipeline.processTasks()
             except Exception as e:
-                logger.warning("OAK-D processTasks failed (%s); reconnecting", e)
+                notify("oakd", f"pipeline error ({e}); reconnecting")
                 self._close_device()
                 self._reconnect_count += 1
                 continue
@@ -363,14 +381,34 @@ class _OakdDevice:
                     self._frame_counts[stream_spec.name] += 1
                     emitted_any = True
             except Exception as e:
-                logger.warning("OAK-D emit failed (%s); reconnecting", e)
+                notify("oakd", f"frame error ({e}); reconnecting")
                 self._close_device()
                 self._reconnect_count += 1
                 continue
 
-            if not emitted_any:
+            if emitted_any and not first_frame_seen:
+                first_frame_seen = True
+                notify("oakd", "streaming")
+            elif not emitted_any:
                 # No queue had data this tick — brief yield to avoid burning CPU.
                 self._stop.wait(timeout=0.001)
+
+            # Periodic actual-vs-target fps; <80% flagged as throttled.
+            now = time.monotonic()
+            elapsed = now - last_fps_report_at
+            if elapsed >= _FPS_REPORT_S and first_frame_seen:
+                parts = []
+                throttled = False
+                for s in self._stream_specs:
+                    delta = self._frame_counts[s.name] - last_fps_counts[s.name]
+                    actual = delta / elapsed
+                    parts.append(f"{s.name}={actual:.1f}/{s.fps}")
+                    if actual < 0.8 * s.fps:
+                        throttled = True
+                    last_fps_counts[s.name] = self._frame_counts[s.name]
+                tag = " ⚠ throttled" if throttled else ""
+                notify_verbose("oakd", f"fps {' '.join(parts)}{tag}")
+                last_fps_report_at = now
 
 
 # ── Mode → streams config ──────────────────────────────────────────────

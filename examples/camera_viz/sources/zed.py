@@ -21,7 +21,6 @@ grab), count consecutive transients, force a reopen past the threshold.
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -29,18 +28,41 @@ from typing import List, Optional
 
 from pipeline import Frame, FrameSource, SourceSpec
 
-logger = logging.getLogger(__name__)
+from ._helpers import notify
+
+
+def _notify(msg: str) -> None:
+    notify("zed", msg)
+
+
+# Open() blocks inside pyzed's C extension; print a USB-3 hint after this
+# long so the user has something to look at on a USB-2 hang.
+_OPEN_HINT_AFTER_S = 8.0
+
 
 RECONNECT_DELAY_S = 2.0
 MAX_CONSECUTIVE_FAILURES = 10
 
-# Resolution preset → (width, height) — must match pyzed.sl.RESOLUTION enums.
+# pyzed.sl.RESOLUTION enum mirror.
 _RESOLUTION_DIMS = {
     "HD2K": (2208, 1242),
     "HD1080": (1920, 1080),
     "HD720": (1280, 720),
     "VGA": (672, 376),
 }
+_DIMS_TO_RESOLUTION = {dims: name for name, dims in _RESOLUTION_DIMS.items()}
+
+
+def _resolution_for_dims(width: int, height: int) -> str:
+    """YAML width × height → SDK preset. Raises with the valid list on mismatch."""
+    key = (int(width), int(height))
+    if key in _DIMS_TO_RESOLUTION:
+        return _DIMS_TO_RESOLUTION[key]
+    valid = ", ".join(f"{n} = {w}x{h}" for n, (w, h) in _RESOLUTION_DIMS.items())
+    raise ValueError(
+        f"ZedSource: {width}x{height} doesn't match any ZED SDK preset. "
+        f"Valid (per-eye): {valid}."
+    )
 
 
 @dataclass
@@ -104,7 +126,8 @@ class _ZedCamera:
         self,
         serial_number: int,
         bus_type: str,
-        resolution: str,
+        width: int,
+        height: int,
         fps: int,
         stereo: bool,
     ) -> None:
@@ -118,11 +141,8 @@ class _ZedCamera:
                 "SDK's Python install instructions for pyzed."
             ) from e
 
-        if resolution.upper() not in _RESOLUTION_DIMS:
-            raise ValueError(
-                f"ZedSource: unknown resolution {resolution!r} "
-                f"(known: {sorted(_RESOLUTION_DIMS)})"
-            )
+        self._resolution_name = _resolution_for_dims(width, height)
+
         if bus_type.lower() not in ("usb", "gmsl"):
             raise ValueError(
                 f"ZedSource: unknown bus_type {bus_type!r} (expected usb | gmsl)"
@@ -130,7 +150,6 @@ class _ZedCamera:
 
         self._serial_number = serial_number
         self._bus_type = bus_type.lower()
-        self._resolution_name = resolution.upper()
         self._fps = fps
         self._stereo = stereo
         self._width, self._height = _RESOLUTION_DIMS[self._resolution_name]
@@ -239,7 +258,24 @@ class _ZedCamera:
         elif self._bus_type == "gmsl":
             init_params.input.setFromCameraID(-1, bus_enum)
 
-        if camera.open(init_params) != sl.ERROR_CODE.SUCCESS:
+        _notify("opening...")
+
+        # Watchdog hint while pyzed.open() blocks in C. USB-2 is the usual cause.
+        opened = threading.Event()
+
+        def _hint():
+            if not opened.wait(timeout=_OPEN_HINT_AFTER_S):
+                _notify("camera not responding — check USB 3 connection")
+
+        threading.Thread(target=_hint, name="zed_open_hint", daemon=True).start()
+
+        try:
+            err = camera.open(init_params)
+        finally:
+            opened.set()
+
+        if err != sl.ERROR_CODE.SUCCESS:
+            _notify(f"open failed ({err})")
             try:
                 camera.close()
             except Exception:
@@ -250,13 +286,9 @@ class _ZedCamera:
         actual_w = info.camera_configuration.resolution.width
         actual_h = info.camera_configuration.resolution.height
         if actual_w != self._width or actual_h != self._height:
-            logger.warning(
-                "ZED resolution mismatch: expected %dx%d, got %dx%d — "
-                "pre-allocated buffers won't match; closing.",
-                self._width,
-                self._height,
-                actual_w,
-                actual_h,
+            _notify(
+                f"resolution mismatch (expected {self._width}x{self._height}, "
+                f"got {actual_w}x{actual_h})"
             )
             camera.close()
             return False
@@ -306,6 +338,7 @@ class _ZedCamera:
             sl.ERROR_CODE.CAMERA_NOT_INITIALIZED,
         }
 
+        first_frame_seen = False
         while not self._stop.is_set():
             if not self._connected:
                 now = time.monotonic()
@@ -316,23 +349,16 @@ class _ZedCamera:
                 try:
                     self._connected = self._open_camera()
                 except Exception as e:
-                    logger.warning("ZED open failed (%s); retrying", e)
+                    _notify(f"open failed ({e})")
                     self._close_camera()
                     self._reconnect_count += 1
                     continue
                 if not self._connected:
                     self._reconnect_count += 1
                     continue
-                logger.info(
-                    "ZED connected: SN=%s, %dx%d@%dfps%s",
-                    self._serial_number or "auto",
-                    self._width,
-                    self._height,
-                    self._fps,
-                    f" (reconnect #{self._reconnect_count})"
-                    if self._reconnect_count
-                    else "",
-                )
+                _notify("connected")
+                # Reset the first-frame breadcrumb after each (re)connect.
+                first_frame_seen = False
 
             err = self._camera.grab(self._runtime_params)
             if err != sl.ERROR_CODE.SUCCESS:
@@ -341,11 +367,7 @@ class _ZedCamera:
                     err in fatal_errors
                     or self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES
                 ):
-                    logger.warning(
-                        "ZED grab failed (%s, %dx consecutive); reconnecting",
-                        err,
-                        self._consecutive_failures,
-                    )
+                    _notify(f"grab failed ({err}); reconnecting")
                     self._close_camera()
                 continue
             self._consecutive_failures = 0
@@ -372,15 +394,15 @@ class _ZedCamera:
                 if retrieve_failed:
                     self._consecutive_failures += 1
                     if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        logger.warning(
-                            "ZED retrieve_image failing %dx; reconnecting",
-                            self._consecutive_failures,
-                        )
+                        _notify("camera connection problem; reconnecting")
                         self._close_camera()
                 else:
                     self._consecutive_failures = 0
+                    if not first_frame_seen:
+                        first_frame_seen = True
+                        _notify("streaming")
             except Exception as e:
-                logger.warning("ZED retrieve/convert failed (%s); reconnecting", e)
+                _notify(f"frame error ({e}); reconnecting")
                 self._close_camera()
                 self._reconnect_count += 1
                 continue
@@ -449,13 +471,14 @@ class ZedSource(FrameSource):
     def build(
         cls,
         base_name: str,
-        resolution: str = "HD720",
+        width: int,
+        height: int,
         fps: int = 30,
         serial_number: int = 0,
         bus_type: str = "usb",
         stereo: bool = True,
     ) -> List["ZedSource"]:
-        camera = _ZedCamera(serial_number, bus_type, resolution, fps, stereo)
+        camera = _ZedCamera(serial_number, bus_type, width, height, fps, stereo)
         eyes = ["left", "right"] if stereo else ["left"]
         return [
             cls(

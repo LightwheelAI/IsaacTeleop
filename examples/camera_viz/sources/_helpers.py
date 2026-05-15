@@ -34,6 +34,8 @@ into the writable GPU buffer using ``self._stream``).
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 import time
 from abc import abstractmethod
@@ -42,6 +44,39 @@ from typing import Optional
 import numpy as np
 
 from pipeline import Frame, FrameSource, SourceSpec
+
+
+def notify(tag: str, msg: str) -> None:
+    # Stderr-direct so it shows without a configured Python logger.
+    # Reserved for lifecycle events; periodic stats use notify_verbose.
+    print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
+
+
+_VERBOSE = False
+
+
+def set_verbose(enabled: bool) -> None:
+    """Set by the entrypoint from the YAML ``verbose:`` flag."""
+    global _VERBOSE
+    _VERBOSE = bool(enabled)
+
+
+def _verbose_enabled() -> bool:
+    if _VERBOSE:
+        return True
+    return os.environ.get("CAMERA_VIZ_VERBOSE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def notify_verbose(tag: str, msg: str) -> None:
+    """Periodic stats; gated by YAML ``verbose:`` or CAMERA_VIZ_VERBOSE."""
+    if _verbose_enabled():
+        print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
+
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +279,8 @@ class PolledSource(FrameSource):
             self._produce_loop_inner()
 
     def _produce_loop_inner(self) -> None:
+        first_frame_seen = False
+        opening_notified = False
         while not self._stop.is_set():
             if not self._connected:
                 now = time.monotonic()
@@ -252,38 +289,25 @@ class PolledSource(FrameSource):
                     self._stop.wait(timeout=0.1)
                     continue
                 self._last_reconnect_attempt_s = now
+                if not opening_notified:
+                    notify(self._kind, "opening...")
+                    opening_notified = True
                 try:
                     self._connected = self._open_device()
                 except Exception as e:
-                    logger.warning(
-                        "%s '%s': open failed (%s); retrying in %.1fs",
-                        self._kind,
-                        self._spec.name,
-                        e,
-                        self._reconnect_delay_s,
-                    )
+                    notify(self._kind, f"open failed ({e})")
                     self._connected = False
                 if not self._connected:
                     self._reconnect_count += 1
                     continue
-                logger.info(
-                    "%s '%s': connected%s",
-                    self._kind,
-                    self._spec.name,
-                    f" (reconnect #{self._reconnect_count})"
-                    if self._reconnect_count
-                    else "",
-                )
+                notify(self._kind, "connected")
+                first_frame_seen = False
+                opening_notified = False
 
             try:
                 host = self._grab()
             except Exception as e:
-                logger.warning(
-                    "%s '%s': grab failed (%s); reconnecting",
-                    self._kind,
-                    self._spec.name,
-                    e,
-                )
+                notify(self._kind, f"grab failed ({e}); reconnecting")
                 self._mark_disconnected()
                 continue
             if host is None:
@@ -296,14 +320,13 @@ class PolledSource(FrameSource):
                 self._upload_and_convert(buf)
                 self._stream.synchronize()
             except Exception as e:
-                logger.warning(
-                    "%s '%s': upload failed (%s); reconnecting",
-                    self._kind,
-                    self._spec.name,
-                    e,
-                )
+                notify(self._kind, f"frame error ({e}); reconnecting")
                 self._mark_disconnected()
                 continue
+
+            if not first_frame_seen:
+                first_frame_seen = True
+                notify(self._kind, "streaming")
 
             with self._publish_lock:
                 self._publish_idx = self._write_idx
@@ -317,3 +340,81 @@ class PolledSource(FrameSource):
             pass
         self._connected = False
         self._last_reconnect_attempt_s = time.monotonic()
+
+
+class PairedFrameSource(FrameSource):
+    """Pair two per-eye FrameSources into one stereo source.
+
+    Caches each child's latest Frame and emits a pair whenever either
+    side updates. The "wait for both, drop on miss" alternative loses
+    frames at the producer-publishes-L-then-R / consumer-polls-between
+    race, halving effective fps. Inter-eye drift is bounded to one
+    producer frame — well under perceptual threshold.
+    """
+
+    def __init__(self, name: str, left: FrameSource, right: FrameSource) -> None:
+        if left.spec.width != right.spec.width or left.spec.height != right.spec.height:
+            raise ValueError(
+                f"PairedFrameSource: left/right resolution mismatch "
+                f"({left.spec.width}x{left.spec.height} vs "
+                f"{right.spec.width}x{right.spec.height})"
+            )
+        if left.spec.pixel_format != right.spec.pixel_format:
+            raise ValueError(
+                f"PairedFrameSource: left/right pixel_format mismatch "
+                f"({left.spec.pixel_format!r} vs {right.spec.pixel_format!r})"
+            )
+        self._spec = SourceSpec(
+            name=name,
+            width=left.spec.width,
+            height=left.spec.height,
+            pixel_format=left.spec.pixel_format,
+        )
+        self._left = left
+        self._right = right
+        self._cached_left: Optional[Frame] = None
+        self._cached_right: Optional[Frame] = None
+
+    @property
+    def spec(self) -> SourceSpec:
+        return self._spec
+
+    @property
+    def left(self) -> FrameSource:
+        # camera_streamer fans out to two independent RTP senders.
+        return self._left
+
+    @property
+    def right(self) -> FrameSource:
+        return self._right
+
+    def start(self) -> None:
+        self._left.start()
+        self._right.start()
+
+    def stop(self) -> None:
+        self._left.stop()
+        self._right.stop()
+
+    def latest(self) -> Optional[Frame]:
+        updated = False
+        fl = self._left.latest()
+        if fl is not None:
+            self._cached_left = fl
+            updated = True
+        fr = self._right.latest()
+        if fr is not None:
+            self._cached_right = fr
+            updated = True
+        if not updated:
+            return None
+        # Both eyes must have produced at least once before we emit.
+        if self._cached_left is None or self._cached_right is None:
+            return None
+        return Frame(
+            image=self._cached_left.image,
+            image_right=self._cached_right.image,
+            timestamp_ns=self._cached_left.timestamp_ns,
+            source_id=self._spec.name,
+            stream=self._cached_left.stream,
+        )

@@ -114,27 +114,36 @@ class VizRunner:
         )
         self._render_thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """Returns True iff both worker threads exited within the join budget.
+
+        Callers MUST NOT destroy the VizSession on False — a thread is
+        still inside session.render() / layer.submit() and tearing the
+        session down under it is a use-after-free on Vulkan / CUDA
+        handles. The non-daemon thread keeps the process alive until
+        it exits; the OS reaps the session at process exit.
+        """
         self._stop.set()
-        # Wake the render thread out of cond.wait so it sees the stop.
+        # Wake the render thread's cond.wait.
         with self._data_cond:
             self._data_cond.notify_all()
         # Bounded joins so a wedged session.render() / source doesn't
-        # block Ctrl-C. Non-daemon threads still block process exit, so
-        # we keep stuck thread references for a later retry. Sources
-        # ALWAYS get stop()ped — they own camera/GStreamer handles and
-        # leaking them on a stuck thread is worse than retrying later.
+        # block Ctrl-C. Sources always get stop()ped (camera / gst
+        # handles) even if a thread is stuck.
+        clean = True
         try:
             if self._render_thread is not None:
                 self._render_thread.join(timeout=5.0)
                 if self._render_thread.is_alive():
                     logger.warning("render thread did not exit within 5s")
+                    clean = False
                 else:
                     self._render_thread = None
             if self._submit_thread is not None:
                 self._submit_thread.join(timeout=5.0)
                 if self._submit_thread.is_alive():
                     logger.warning("submit thread did not exit within 5s")
+                    clean = False
                 else:
                     self._submit_thread = None
         finally:
@@ -143,6 +152,7 @@ class VizRunner:
                     s.stop()
                 except Exception:
                     logger.exception("source.stop() raised")
+        return clean
 
     def wait(self) -> None:
         """Block until the render thread exits, then re-raise any captured
@@ -200,7 +210,10 @@ class VizRunner:
                 if not device_pinned:
                     self._pin_to_device(frame)
                     device_pinned = True
-                layer.submit(frame.image, stream=frame.stream)
+                if frame.image_right is not None:
+                    layer.submit(frame.image, frame.image_right, stream=frame.stream)
+                else:
+                    layer.submit(frame.image, stream=frame.stream)
                 published_any = True
             if published_any:
                 with self._data_cond:
